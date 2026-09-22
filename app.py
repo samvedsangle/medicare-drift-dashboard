@@ -144,6 +144,14 @@ MODEL_FEATURES = [
 PSI_FLAG_THRESHOLD = 0.25
 FDR_ALPHA = 0.05
 MEMO_RATE_LIMIT = 10
+# Default cold-start fetch is a smaller trailing window of years, not the
+# full configured history: fetching all years concurrently, each with its
+# own paginated sequence of requests, held enough in-flight data at once to
+# exceed Streamlit Community Cloud's free-tier memory ceiling (an OOM kill,
+# not a code exception — the process died with no traceback). Full history
+# is available as an opt-in from the sidebar.
+DEFAULT_YEAR_WINDOW = 3
+FETCH_MAX_WORKERS = 3
 
 
 # ---------------------------------------------------------------------------
@@ -208,7 +216,7 @@ def load_all_years(specialty: str, years: tuple) -> pd.DataFrame:
     frames = []
     progress = st.progress(0.0, text="Starting fetch…")
     completed = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=FETCH_MAX_WORKERS) as executor:
         future_to_year = {executor.submit(fetch_year, yr, specialty): yr for yr in years}
         for future in concurrent.futures.as_completed(future_to_year):
             yr = future_to_year[future]
@@ -591,7 +599,14 @@ st.caption(
 with st.sidebar:
     st.header("Filters")
     specialty = st.selectbox("Specialty", SPECIALTIES, index=0)
-    years = tuple(sorted(DATASETS.keys()))
+    all_years = tuple(sorted(DATASETS.keys()))
+    recent_years = all_years[-DEFAULT_YEAR_WINDOW:]
+    full_history = st.checkbox(
+        f"Load full {len(all_years)}-year history (slower, more memory)",
+        value=False,
+        help=f"Default is the most recent {DEFAULT_YEAR_WINDOW} years for a fast first load.",
+    )
+    years = all_years if full_history else recent_years
     st.caption(f"Years analyzed: {years[0]}–{years[-1]}")
 
 years_key = years
