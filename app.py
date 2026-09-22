@@ -158,29 +158,37 @@ FETCH_MAX_WORKERS = 2
 # Data fetch (cached, live — nothing written to disk)
 # ---------------------------------------------------------------------------
 
+PAGE_FETCH_WORKERS = 3
+
+
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
 def fetch_year(year: int, specialty: str, _page_counter: dict | None = None) -> pd.DataFrame:
     """Fetch one year's data for one specialty via CMS's data-api, which
     filters server-side (filter[Rndrng_Prvdr_Type]=<specialty>) — the bulk
     CSV distribution for this dataset is a multi-gigabyte national file with
     no server-side filter, which made a live per-specialty fetch far too
-    slow (minutes per year, regardless of parsing engine). Paginates in
-    API_PAGE_SIZE chunks, CMS's hard per-request cap. Nothing is written to
-    disk.
+    slow (minutes per year, regardless of parsing engine).
+
+    Pages are fetched PAGE_FETCH_WORKERS at a time rather than one at a
+    time: a specialty needing ~27 pages was paying ~27 sequential
+    round-trips for no reason, since CMS's API has no problem serving
+    several requests concurrently. Combined with FETCH_MAX_WORKERS years
+    running concurrently in `load_all_years`, peak concurrent connections
+    is PAGE_FETCH_WORKERS x FETCH_MAX_WORKERS — kept modest on purpose so
+    this doesn't re-trigger Streamlit Cloud's CPU throttle. Each batch is
+    processed in offset order and stops at the first short/empty page, so
+    pagination correctness doesn't depend on request completion order.
+    Nothing is written to disk.
 
     `_page_counter` (leading underscore so st.cache_data excludes it from
     the cache key) is an optional shared dict this bumps after every page,
     so a caller running this in a background thread can report live
-    within-year progress rather than only "year N of M done" — a fetch
-    that's mid-pagination for its very first year otherwise looks frozen
-    for however long that whole year takes, especially under CPU throttling."""
+    within-year progress rather than only "year N of M done"."""
     dataset_id = DATASETS[year]
     base_url = f"https://data.cms.gov/data-api/v1/dataset/{dataset_id}/data"
     raw_to_canon = {v: k for k, v in SCHEMA_MAP.items()}
 
-    records = []
-    offset = 0
-    while True:
+    def fetch_page(offset: int):
         params = {
             "filter[Rndrng_Prvdr_Type]": specialty,
             "size": API_PAGE_SIZE,
@@ -191,12 +199,29 @@ def fetch_year(year: int, specialty: str, _page_counter: dict | None = None) -> 
         page = resp.json()
         if _page_counter is not None:
             _page_counter[year] = _page_counter.get(year, 0) + 1
-        if not page:
-            break
-        records.extend(page)
-        if len(page) < API_PAGE_SIZE:
-            break
-        offset += API_PAGE_SIZE
+        return offset, page
+
+    records = []
+    next_offset = 0
+    done = False
+    with concurrent.futures.ThreadPoolExecutor(max_workers=PAGE_FETCH_WORKERS) as pool:
+        while not done:
+            batch_offsets = [next_offset + i * API_PAGE_SIZE for i in range(PAGE_FETCH_WORKERS)]
+            # Submit all of the batch first (eager list), *then* collect
+            # results — submitting inside the generator sorted() consumes
+            # would call .result() on each future before the next is even
+            # submitted, silently serializing everything.
+            futures = [pool.submit(fetch_page, o) for o in batch_offsets]
+            batch = sorted((f.result() for f in futures), key=lambda x: x[0])
+            for _offset, page in batch:
+                if not page:
+                    done = True
+                    break
+                records.extend(page)
+                if len(page) < API_PAGE_SIZE:
+                    done = True
+                    break
+            next_offset += PAGE_FETCH_WORKERS * API_PAGE_SIZE
 
     if not records:
         return pd.DataFrame(columns=REQUIRED_COLS + ["year"] + [f"{c}_adj" for c in DOLLAR_COLS])
