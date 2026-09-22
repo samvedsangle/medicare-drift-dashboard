@@ -152,13 +152,12 @@ MEMO_RATE_LIMIT = 10
 # is available as an opt-in from the sidebar.
 DEFAULT_YEAR_WINDOW = 3
 FETCH_MAX_WORKERS = 2
+PAGE_FETCH_WORKERS = 3
 
 
 # ---------------------------------------------------------------------------
 # Data fetch (cached, live — nothing written to disk)
 # ---------------------------------------------------------------------------
-
-PAGE_FETCH_WORKERS = 3
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
@@ -766,9 +765,14 @@ with tab_provider:
                 with st.spinner("Generating memo…"):
                     memo_text = generate_memo(provider_row.iloc[0], drift_row, shap_explanation)
                 st.session_state["last_memo"] = memo_text
+                st.session_state["last_memo_npi"] = selected_npi
             except Exception as exc:
                 st.error(f"Memo generation failed: {exc}")
-    if "last_memo" in st.session_state:
+    # Only show a memo if it was generated for the CURRENTLY selected
+    # provider — otherwise switching providers without re-clicking left the
+    # previous provider's memo text displayed under the new provider's
+    # section with nothing indicating it was stale/mismatched.
+    if st.session_state.get("last_memo_npi") == selected_npi and "last_memo" in st.session_state:
         st.markdown(st.session_state["last_memo"])
 
 with tab_specialty:
