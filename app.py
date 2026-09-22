@@ -151,7 +151,7 @@ MEMO_RATE_LIMIT = 10
 # not a code exception — the process died with no traceback). Full history
 # is available as an opt-in from the sidebar.
 DEFAULT_YEAR_WINDOW = 3
-FETCH_MAX_WORKERS = 3
+FETCH_MAX_WORKERS = 2
 
 
 # ---------------------------------------------------------------------------
@@ -159,14 +159,21 @@ FETCH_MAX_WORKERS = 3
 # ---------------------------------------------------------------------------
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
-def fetch_year(year: int, specialty: str) -> pd.DataFrame:
+def fetch_year(year: int, specialty: str, _page_counter: dict | None = None) -> pd.DataFrame:
     """Fetch one year's data for one specialty via CMS's data-api, which
     filters server-side (filter[Rndrng_Prvdr_Type]=<specialty>) — the bulk
     CSV distribution for this dataset is a multi-gigabyte national file with
     no server-side filter, which made a live per-specialty fetch far too
     slow (minutes per year, regardless of parsing engine). Paginates in
     API_PAGE_SIZE chunks, CMS's hard per-request cap. Nothing is written to
-    disk."""
+    disk.
+
+    `_page_counter` (leading underscore so st.cache_data excludes it from
+    the cache key) is an optional shared dict this bumps after every page,
+    so a caller running this in a background thread can report live
+    within-year progress rather than only "year N of M done" — a fetch
+    that's mid-pagination for its very first year otherwise looks frozen
+    for however long that whole year takes, especially under CPU throttling."""
     dataset_id = DATASETS[year]
     base_url = f"https://data.cms.gov/data-api/v1/dataset/{dataset_id}/data"
     raw_to_canon = {v: k for k, v in SCHEMA_MAP.items()}
@@ -182,6 +189,8 @@ def fetch_year(year: int, specialty: str) -> pd.DataFrame:
         resp = requests.get(base_url, params=params, timeout=60)
         resp.raise_for_status()
         page = resp.json()
+        if _page_counter is not None:
+            _page_counter[year] = _page_counter.get(year, 0) + 1
         if not page:
             break
         records.extend(page)
@@ -212,20 +221,34 @@ def load_all_years(specialty: str, years: tuple) -> pd.DataFrame:
     Each year requires its own paginated sequence of API calls (a busy
     specialty can need dozens of pages), so years are fetched concurrently
     rather than one after another: sequential 8-year fetches were the
-    direct cause of the 600s+ cold-start timeouts seen on Streamlit Cloud."""
+    direct cause of the 600s+ cold-start timeouts seen on Streamlit Cloud.
+
+    Progress is polled (not just updated on each year's completion) and
+    reports pages retrieved so far across all in-flight years — otherwise
+    the bar sits frozen at "Starting fetch…" for the entire duration of
+    whichever year finishes first, which under Streamlit Cloud's CPU
+    throttling can be minutes and looks indistinguishable from a hang."""
     frames = []
     progress = st.progress(0.0, text="Starting fetch…")
+    page_counts: dict = {}
     completed = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=FETCH_MAX_WORKERS) as executor:
-        future_to_year = {executor.submit(fetch_year, yr, specialty): yr for yr in years}
-        for future in concurrent.futures.as_completed(future_to_year):
-            yr = future_to_year[future]
-            try:
-                frames.append(future.result())
-            except (OSError, ValueError, requests.exceptions.RequestException) as exc:
-                st.warning(f"Could not load {yr} ({exc}); continuing with remaining years.")
-            completed += 1
-            progress.progress(completed / len(years), text=f"Fetched {completed}/{len(years)} years…")
+        future_to_year = {executor.submit(fetch_year, yr, specialty, page_counts): yr for yr in years}
+        pending = set(future_to_year)
+        while pending:
+            done, pending = concurrent.futures.wait(pending, timeout=1.0)
+            for future in done:
+                yr = future_to_year[future]
+                try:
+                    frames.append(future.result())
+                except (OSError, ValueError, requests.exceptions.RequestException) as exc:
+                    st.warning(f"Could not load {yr} ({exc}); continuing with remaining years.")
+                completed += 1
+            total_pages = sum(page_counts.values())
+            progress.progress(
+                completed / len(years),
+                text=f"Fetched {completed}/{len(years)} years — {total_pages} pages retrieved so far…",
+            )
     progress.empty()
     if not frames:
         return pd.DataFrame()
