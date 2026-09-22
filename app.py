@@ -256,46 +256,61 @@ def load_all_years(specialty: str, years: tuple) -> pd.DataFrame:
 
 
 def build_provider_features(raw_df: pd.DataFrame) -> pd.DataFrame:
-    """Collapse provider-service-line rows into one row per (npi, year)."""
+    """Collapse provider-service-line rows into one row per (npi, year).
+    Fully vectorized (groupby/transform, no per-group Python loop) — a
+    per-group Python loop here was a real CPU hot spot for larger
+    specialties, contributing to Streamlit Cloud's CPU throttling.
+    `state` uses each provider-year's first row rather than a true mode,
+    trading a rare multi-state-in-one-year edge case for a big speedup."""
     if raw_df.empty:
         return pd.DataFrame()
 
-    def _entropy(counts: np.ndarray) -> float:
-        p = counts / counts.sum()
-        p = p[p > 0]
-        return float(-(p * np.log(p)).sum())
+    df = raw_df.loc[raw_df["tot_srvcs"] > 0].copy()
+    df["_w_payment"] = df["avg_medicare_payment_adj"] * df["tot_srvcs"]
+    df["_w_allowed"] = df["avg_medicare_allowed_adj"] * df["tot_srvcs"]
+    df["_w_submitted"] = df["avg_submitted_chrg_adj"] * df["tot_srvcs"]
 
-    records = []
-    for (npi_val, year), grp in raw_df.groupby(["npi", "year"]):
-        tot_srvcs = grp["tot_srvcs"].sum()
-        tot_benes = grp["tot_benes"].sum()
-        if tot_srvcs <= 0:
-            continue
-        payment_per_service = (grp["avg_medicare_payment_adj"] * grp["tot_srvcs"]).sum() / tot_srvcs
-        allowed_per_service = (grp["avg_medicare_allowed_adj"] * grp["tot_srvcs"]).sum() / tot_srvcs
-        submitted_per_service = (grp["avg_submitted_chrg_adj"] * grp["tot_srvcs"]).sum() / tot_srvcs
-        submitted_allowed_ratio = submitted_per_service / allowed_per_service if allowed_per_service else np.nan
-        code_volumes = grp.groupby("hcpcs_code")["tot_srvcs"].sum().values
-        records.append(
-            {
-                "npi": npi_val,
-                "year": year,
-                "specialty": grp["specialty"].iloc[0],
-                "state": grp["state"].mode().iat[0] if not grp["state"].mode().empty else np.nan,
-                "last_name": grp["last_name"].iloc[0],
-                "first_name": grp["first_name"].iloc[0],
-                "city": grp["city"].iloc[0],
-                "tot_srvcs": tot_srvcs,
-                "tot_benes": tot_benes,
-                "log_tot_srvcs": np.log1p(tot_srvcs),
-                "log_tot_benes": np.log1p(tot_benes),
-                "payment_per_service": payment_per_service,
-                "submitted_allowed_ratio": submitted_allowed_ratio,
-                "hcpcs_entropy": _entropy(code_volumes),
-                "n_hcpcs_codes": grp["hcpcs_code"].nunique(),
-            }
-        )
-    return pd.DataFrame(records)
+    agg = df.groupby(["npi", "year"], as_index=False).agg(
+        specialty=("specialty", "first"),
+        state=("state", "first"),
+        last_name=("last_name", "first"),
+        first_name=("first_name", "first"),
+        city=("city", "first"),
+        tot_srvcs=("tot_srvcs", "sum"),
+        tot_benes=("tot_benes", "sum"),
+        w_payment=("_w_payment", "sum"),
+        w_allowed=("_w_allowed", "sum"),
+        w_submitted=("_w_submitted", "sum"),
+        n_hcpcs_codes=("hcpcs_code", "nunique"),
+    )
+
+    agg["log_tot_srvcs"] = np.log1p(agg["tot_srvcs"])
+    agg["log_tot_benes"] = np.log1p(agg["tot_benes"])
+    agg["payment_per_service"] = agg["w_payment"] / agg["tot_srvcs"]
+    allowed_per_service = agg["w_allowed"] / agg["tot_srvcs"]
+    submitted_per_service = agg["w_submitted"] / agg["tot_srvcs"]
+    agg["submitted_allowed_ratio"] = np.where(
+        allowed_per_service > 0, submitted_per_service / allowed_per_service, np.nan
+    )
+
+    code_sums = df.groupby(["npi", "year", "hcpcs_code"])["tot_srvcs"].sum().reset_index(name="code_srvcs")
+    code_totals = code_sums.groupby(["npi", "year"])["code_srvcs"].transform("sum")
+    p = code_sums["code_srvcs"] / code_totals
+    code_sums["p_logp"] = np.where(p > 0, -p * np.log(p), 0.0)
+    entropy = (
+        code_sums.groupby(["npi", "year"], as_index=False)["p_logp"]
+        .sum()
+        .rename(columns={"p_logp": "hcpcs_entropy"})
+    )
+
+    out = agg.merge(entropy, on=["npi", "year"], how="left")
+    return out[
+        [
+            "npi", "year", "specialty", "state", "last_name", "first_name", "city",
+            "tot_srvcs", "tot_benes", "log_tot_srvcs", "log_tot_benes",
+            "payment_per_service", "submitted_allowed_ratio", "hcpcs_entropy", "n_hcpcs_codes",
+        ]
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -398,14 +413,18 @@ def compute_drift(raw_df: pd.DataFrame, features: pd.DataFrame, metrics=DRIFT_ME
     result["fdr_p"] = p_adj
     result["z_flag"] = result["fdr_p"] < FDR_ALPHA
 
+    # Pre-filter to common NPIs and pre-group both years once — looking up
+    # curr_raw with a fresh boolean mask inside the loop (curr_raw.npi ==
+    # npi_val) was an O(n_providers x n_rows) scan, a real CPU hot spot for
+    # larger specialties. Dict-of-groups lookups make each iteration O(1).
+    prev_common_raw = raw_df.loc[(raw_df.year == y0) & raw_df["npi"].isin(common)]
+    curr_common_raw = raw_df.loc[(raw_df.year == y1) & raw_df["npi"].isin(common)]
+    curr_groups = dict(tuple(curr_common_raw.groupby("npi")))
+
     psi_scores = {}
-    prev_raw = raw_df[raw_df.year == y0]
-    curr_raw = raw_df[raw_df.year == y1]
-    for npi_val, grp0 in prev_raw.groupby("npi"):
-        if npi_val not in common:
-            continue
-        grp1 = curr_raw[curr_raw.npi == npi_val]
-        if len(grp0) >= 5 and len(grp1) >= 5:
+    for npi_val, grp0 in prev_common_raw.groupby("npi"):
+        grp1 = curr_groups.get(npi_val)
+        if grp1 is not None and len(grp0) >= 5 and len(grp1) >= 5:
             psi_scores[npi_val] = psi(grp0["avg_medicare_payment_adj"], grp1["avg_medicare_payment_adj"])
     result["psi_score"] = pd.Series(psi_scores)
     result["psi_flag"] = result["psi_score"] > PSI_FLAG_THRESHOLD
@@ -432,13 +451,17 @@ def compute_communities(features: pd.DataFrame, year: int, k_neighbors: int = 8)
     dist, idx = nn.kneighbors(X)
 
     npis = sub["npi"].values
+    # Vectorize the neighbor-index/weight bookkeeping with numpy instead of
+    # a nested Python double loop — add_edges_from still costs one Python
+    # call per edge (networkx graphs are Python objects), but this removes
+    # the per-element index math that dominated for larger specialties.
+    src_idx = np.repeat(np.arange(len(sub)), n_neighbors - 1)
+    dst_idx = idx[:, 1:].ravel()
+    weights = 1.0 / (1.0 + dist[:, 1:].ravel())
+
     G = nx.Graph()
     G.add_nodes_from(npis)
-    for i in range(len(sub)):
-        for j_pos in range(1, idx.shape[1]):
-            j = idx[i, j_pos]
-            weight = 1.0 / (1.0 + dist[i, j_pos])
-            G.add_edge(npis[i], npis[j], weight=weight)
+    G.add_weighted_edges_from(zip(npis[src_idx], npis[dst_idx], weights))
 
     communities = nx.algorithms.community.louvain_communities(G, weight="weight", seed=42)
     community_map = {}
