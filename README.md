@@ -108,17 +108,31 @@ data — it is a starting point for human review, never a substitute for it.
   `filter[Rndrng_Prvdr_Type]=<specialty>` server-side, paginated at its hard
   cap of 6,500 rows/request. Results are cached in-process for 24 hours
   (`st.cache_data`), keyed per (year, specialty).
-- **Years are fetched concurrently.** A single specialty-year can still need
-  dozens of paginated requests (e.g. Podiatry is ~173K rows/year, ~27 pages),
-  so `load_all_years` fetches all 8 configured years in parallel via a thread
-  pool rather than one after another — fetching sequentially was still slow
-  enough to trip cold-start timeouts even after switching off the bulk CSV.
-- The sidebar specialty list is ordered smallest-practical-default first
-  (`SPECIALTIES[0]` is what a cold instance fetches on first load); very large
-  specialties (Internal Medicine, Family Practice) can still take noticeably
-  longer since pagination *within* a single year isn't yet parallelized — only
-  across years. If that becomes the bottleneck, the next step is parallelizing
-  each year's own page requests too.
+- **Fetching is parallel at two levels, deliberately bounded.** A single
+  specialty-year can need dozens of paginated requests (e.g. Podiatry is
+  ~173K rows/year, ~27 pages) — sequential pagination, and sequential years
+  on top of that, were both directly responsible for cold-start timeouts and
+  the "looks frozen" UX even after switching off the bulk CSV. `fetch_year`
+  now fetches `PAGE_FETCH_WORKERS` (3) pages at a time within a year, and
+  `load_all_years` fetches `FETCH_MAX_WORKERS` (2) years at a time — peak
+  concurrent connections is the product of the two (6), sized conservatively
+  because higher concurrency previously triggered Streamlit Cloud's CPU
+  throttle. Progress is polled every second and reports pages retrieved so
+  far, not just "year N of M done", so a slow fetch still looks alive.
+- The default fetch window is the most recent `DEFAULT_YEAR_WINDOW` (3)
+  years, not the full 8 — fetching all years at once held enough in-flight
+  data to exceed the free tier's memory ceiling (an OOM kill with no Python
+  traceback, not a code exception). Full history is an opt-in sidebar
+  checkbox. The specialty list is ordered smallest-practical-default first
+  (`SPECIALTIES[0]` is what a cold instance fetches on first load); very
+  large specialties (Internal Medicine, Family Practice) still take longer
+  since page/year concurrency is capped for safety, not raw specialty size.
+- `build_provider_features`, the PSI step in `compute_drift`, and the
+  community-graph edge construction are all vectorized (pandas
+  groupby/transform, dict-lookups instead of repeated boolean scans, numpy
+  index math) rather than looping in pure Python — those loops were a real
+  CPU cost for larger specialties and a plausible contributor to the
+  throttle, independent of the fetch itself.
 - If first-load latency on Streamlit Community Cloud's free tier is still too
   slow for a good first impression, the next architectural step is a scheduled
   offline job that pre-computes peer clusters, drift, and models and writes the
