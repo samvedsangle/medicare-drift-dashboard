@@ -91,31 +91,35 @@ CPI = {
 }
 BASE_YEAR = 2024
 
+# Ordered smallest-practical-default first: the selectbox default (index 0)
+# is what a cold Streamlit Cloud instance fetches on first load, and the
+# biggest specialties (Internal Medicine, Family Practice) are more likely
+# to hit the free tier's memory/time ceiling on a cold start.
 SPECIALTIES = [
-    "Internal Medicine",
-    "Family Practice",
-    "Emergency Medicine",
-    "Cardiology",
-    "Diagnostic Radiology",
-    "Orthopedic Surgery",
-    "General Surgery",
-    "Anesthesiology",
-    "Dermatology",
-    "Ophthalmology",
-    "Psychiatry",
-    "Neurology",
-    "Urology",
-    "Gastroenterology",
-    "Pulmonary Disease",
-    "Nephrology",
-    "Rheumatology",
-    "Pain Management",
-    "Physical Therapist",
-    "Nurse Practitioner",
-    "Physician Assistant",
     "Podiatry",
     "Optometry",
     "Chiropractic",
+    "Physical Therapist",
+    "Dermatology",
+    "Ophthalmology",
+    "Psychiatry",
+    "Rheumatology",
+    "Pain Management",
+    "Nephrology",
+    "Pulmonary Disease",
+    "Gastroenterology",
+    "Urology",
+    "Neurology",
+    "Anesthesiology",
+    "General Surgery",
+    "Orthopedic Surgery",
+    "Diagnostic Radiology",
+    "Cardiology",
+    "Emergency Medicine",
+    "Nurse Practitioner",
+    "Physician Assistant",
+    "Family Practice",
+    "Internal Medicine",
 ]
 
 DRIFT_METRICS = ("payment_per_service", "hcpcs_entropy", "submitted_allowed_ratio", "log_tot_srvcs")
