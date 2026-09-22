@@ -1,0 +1,13 @@
+streamlit
+pandas
+numpy
+requests
+networkx
+scikit-learn
+scipy
+statsmodels
+xgboost
+plotly
+shap
+matplotlib
+anthropic
