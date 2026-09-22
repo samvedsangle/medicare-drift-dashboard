@@ -1,9 +1,12 @@
+import concurrent.futures
+
 import matplotlib.pyplot as plt
 import networkx as nx
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import requests
 import shap
 import streamlit as st
 import xgboost as xgb
@@ -24,16 +27,23 @@ st.set_page_config(
 # Constants
 # ---------------------------------------------------------------------------
 
+# Year -> CMS data-api dataset id (data.cms.gov's real filterable JSON API
+# for this dataset, NOT the bulk CSV distribution). The bulk CSVs for this
+# dataset are multi-gigabyte national files with no server-side filter,
+# which is far too slow for a live per-specialty fetch; this API supports
+# filter[Rndrng_Prvdr_Type]=<specialty> server-side, at a hard cap of
+# API_PAGE_SIZE rows per request (paginated via `offset` in fetch_year).
 DATASETS = {
-    2024: "https://data.cms.gov/sites/default/files/2026-05/b5ebab5a-f490-418a-9bce-4b9f31419356/PHY_R26_P05_V10_D24_Prov_Svc.csv",
-    2023: "https://data.cms.gov/sites/default/files/2025-04/e3f823f8-db5b-4cc7-ba04-e7ae92b99757/MUP_PHY_R25_P05_V20_D23_Prov_Svc.csv",
-    2022: "https://data.cms.gov/sites/default/files/2025-11/53fb2bae-4913-48dc-a6d4-d8c025906567/MUP_PHY_R25_P05_V20_D22_Prov_Svc.csv",
-    2021: "https://data.cms.gov/sites/default/files/2025-11/bffaf97a-c2ab-4fd7-8718-be90742e3485/MUP_PHY_R25_P05_V20_D21_Prov_Svc.csv",
-    2020: "https://data.cms.gov/sites/default/files/2025-11/d22b18cd-7726-4bf5-8e9c-3e4587c589a1/MUP_PHY_R25_P05_V20_D20_Prov_Svc.csv",
-    2019: "https://data.cms.gov/sites/default/files/2025-11/7befba27-752e-47a8-a76c-6c6d4f74f2e3/MUP_PHY_R25_P04_V20_D19_Prov_Svc.csv",
-    2018: "https://data.cms.gov/sites/default/files/2025-11/5669eafb-f0b3-4dc5-be6d-abc09b480c2e/MUP_PHY_R25_P04_V20_D18_Prov_Svc.csv",
-    2017: "https://data.cms.gov/sites/default/files/2025-11/4623fb40-781e-4eef-860e-b851cd5d10ea/MUP_PHY_R25_P04_V20_D17_Prov_Svc.csv",
+    2024: "92396110-2aed-4d63-a6a2-5d6207d46a29",
+    2023: "0e9f2f2b-7bf9-451a-912c-e02e654dd725",
+    2022: "e650987d-01b7-4f09-b75e-b0b075afbf98",
+    2021: "31dc2c47-f297-4948-bfb4-075e1bec3a02",
+    2020: "c957b49e-1323-49e7-8678-c09da387551d",
+    2019: "867b8ac7-ccb7-4cc9-873d-b24340d89e32",
+    2018: "fb6d9fe8-38c1-4d24-83d4-0b7b291000b2",
+    2017: "85bf3c9c-2244-490d-ad7d-c34e4c28f8ea",
 }
+API_PAGE_SIZE = 6500
 
 # Canonical name -> raw CMS column name. Verified live against the 2016, 2017
 # and 2024 distributions: CMS has back-normalized every reissued year to this
@@ -142,30 +152,41 @@ MEMO_RATE_LIMIT = 10
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
 def fetch_year(year: int, specialty: str) -> pd.DataFrame:
-    """Stream one year's CMS provider-service CSV and keep only rows for
-    `specialty`, so peak memory stays bounded regardless of the full file
-    size (these run into the hundreds of MB per year)."""
-    url = DATASETS[year]
+    """Fetch one year's data for one specialty via CMS's data-api, which
+    filters server-side (filter[Rndrng_Prvdr_Type]=<specialty>) — the bulk
+    CSV distribution for this dataset is a multi-gigabyte national file with
+    no server-side filter, which made a live per-specialty fetch far too
+    slow (minutes per year, regardless of parsing engine). Paginates in
+    API_PAGE_SIZE chunks, CMS's hard per-request cap. Nothing is written to
+    disk."""
+    dataset_id = DATASETS[year]
+    base_url = f"https://data.cms.gov/data-api/v1/dataset/{dataset_id}/data"
     raw_to_canon = {v: k for k, v in SCHEMA_MAP.items()}
-    usecols = list(SCHEMA_MAP.values())
 
-    chunks = []
-    # Let pandas manage the HTTP stream directly (via urllib) rather than
-    # wrapping requests' raw socket in a TextIOWrapper — on multi-hundred-MB
-    # chunked-transfer files the manual wrapper's connection got torn down
-    # mid-read ("I/O operation on closed file"); pandas' own remote-CSV path
-    # doesn't have that failure mode.
-    reader = pd.read_csv(url, usecols=usecols, chunksize=250_000, low_memory=False)
-    for chunk in reader:
-        chunk = chunk.rename(columns=raw_to_canon)
-        filtered = chunk.loc[chunk["specialty"] == specialty]
-        if not filtered.empty:
-            chunks.append(filtered.copy())
+    records = []
+    offset = 0
+    while True:
+        params = {
+            "filter[Rndrng_Prvdr_Type]": specialty,
+            "size": API_PAGE_SIZE,
+            "offset": offset,
+        }
+        resp = requests.get(base_url, params=params, timeout=60)
+        resp.raise_for_status()
+        page = resp.json()
+        if not page:
+            break
+        records.extend(page)
+        if len(page) < API_PAGE_SIZE:
+            break
+        offset += API_PAGE_SIZE
 
-    if not chunks:
+    if not records:
         return pd.DataFrame(columns=REQUIRED_COLS + ["year"] + [f"{c}_adj" for c in DOLLAR_COLS])
 
-    df = pd.concat(chunks, ignore_index=True)
+    df = pd.DataFrame.from_records(records)
+    df = df.rename(columns=raw_to_canon)[REQUIRED_COLS]
+
     df["npi"] = df["npi"].astype(str)
     for c in NUMERIC_COLS:
         df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -178,14 +199,26 @@ def fetch_year(year: int, specialty: str) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
 def load_all_years(specialty: str, years: tuple) -> pd.DataFrame:
+    """Not itself cached — `fetch_year` is cached per (year, specialty).
+    Each year requires its own paginated sequence of API calls (a busy
+    specialty can need dozens of pages), so years are fetched concurrently
+    rather than one after another: sequential 8-year fetches were the
+    direct cause of the 600s+ cold-start timeouts seen on Streamlit Cloud."""
     frames = []
-    for yr in years:
-        try:
-            frames.append(fetch_year(yr, specialty))
-        except (OSError, ValueError) as exc:
-            st.warning(f"Could not load {yr} ({exc}); continuing with remaining years.")
+    progress = st.progress(0.0, text="Starting fetch…")
+    completed = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        future_to_year = {executor.submit(fetch_year, yr, specialty): yr for yr in years}
+        for future in concurrent.futures.as_completed(future_to_year):
+            yr = future_to_year[future]
+            try:
+                frames.append(future.result())
+            except (OSError, ValueError, requests.exceptions.RequestException) as exc:
+                st.warning(f"Could not load {yr} ({exc}); continuing with remaining years.")
+            completed += 1
+            progress.progress(completed / len(years), text=f"Fetched {completed}/{len(years)} years…")
+    progress.empty()
     if not frames:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True)

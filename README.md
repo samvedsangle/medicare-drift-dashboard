@@ -99,21 +99,31 @@ data — it is a starting point for human review, never a substitute for it.
 
 ## Architecture notes
 
-- **Live-fetch, no stored files.** `fetch_year` streams each year's CSV directly
-  from `data.cms.gov` and filters to the selected specialty chunk-by-chunk, so
-  memory stays bounded by one specialty's data at a time rather than the full
-  multi-GB national file. Results are cached in-process for 24 hours
-  (`st.cache_data`).
-- **First load per specialty is slow (CMS-file-size dependent, often 15s–2min+
-  across all 8 years)** because the full yearly file must be streamed over the
-  network to filter it — there's no server-side specialty filter on the raw CSV
-  endpoint. Switching providers within an already-loaded specialty is fast, since
-  clustering, drift, and model training are cached per specialty/year-range.
-- If first-load latency on Streamlit Community Cloud's free tier ends up too slow
-  for a good first impression, the next architectural step is a scheduled offline
-  job that pre-computes peer clusters, drift, and models and writes the results
-  to a small warehouse (e.g., Snowflake) for the app to read — trading live-data
-  freshness for instant load.
+- **Live-fetch, no stored files, no bulk downloads.** CMS also publishes this
+  dataset as a multi-gigabyte national bulk CSV per year with no server-side
+  filter — an early version of this app streamed and filtered that file
+  client-side, which took 10+ minutes per year and crashed on Streamlit
+  Community Cloud's free tier. `fetch_year` instead calls CMS's real filterable
+  JSON API (`data.cms.gov/data-api/v1/dataset/<id>/data`), which supports
+  `filter[Rndrng_Prvdr_Type]=<specialty>` server-side, paginated at its hard
+  cap of 6,500 rows/request. Results are cached in-process for 24 hours
+  (`st.cache_data`), keyed per (year, specialty).
+- **Years are fetched concurrently.** A single specialty-year can still need
+  dozens of paginated requests (e.g. Podiatry is ~173K rows/year, ~27 pages),
+  so `load_all_years` fetches all 8 configured years in parallel via a thread
+  pool rather than one after another — fetching sequentially was still slow
+  enough to trip cold-start timeouts even after switching off the bulk CSV.
+- The sidebar specialty list is ordered smallest-practical-default first
+  (`SPECIALTIES[0]` is what a cold instance fetches on first load); very large
+  specialties (Internal Medicine, Family Practice) can still take noticeably
+  longer since pagination *within* a single year isn't yet parallelized — only
+  across years. If that becomes the bottleneck, the next step is parallelizing
+  each year's own page requests too.
+- If first-load latency on Streamlit Community Cloud's free tier is still too
+  slow for a good first impression, the next architectural step is a scheduled
+  offline job that pre-computes peer clusters, drift, and models and writes the
+  results to a small warehouse (e.g., Snowflake) for the app to read — trading
+  live-data freshness for instant load.
 
 ## Running locally
 
