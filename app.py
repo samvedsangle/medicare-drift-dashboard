@@ -1,4 +1,6 @@
 import concurrent.futures
+import ctypes
+import gc
 
 import matplotlib.pyplot as plt
 import networkx as nx
@@ -66,23 +68,37 @@ SCHEMA_MAP = {
     "avg_medicare_stdzd": "Avg_Mdcr_Stdzd_Amt",
 }
 
-REQUIRED_COLS = list(SCHEMA_MAP.keys())
+# Columns the analysis actually reads. The API returns ~28 fields per row,
+# including long free text (procedure descriptions) that nothing uses;
+# holding all of it made a cold fetch spike to ~650MB per year on a host
+# with a hard memory ceiling.
+REQUIRED_COLS = [
+    "npi",
+    "last_name",
+    "first_name",
+    "city",
+    "state",
+    "specialty",
+    "hcpcs_code",
+    "tot_benes",
+    "tot_srvcs",
+    "avg_submitted_chrg",
+    "avg_medicare_allowed",
+    "avg_medicare_payment",
+]
 
 NUMERIC_COLS = [
     "tot_benes",
     "tot_srvcs",
-    "tot_bene_day_srvcs",
     "avg_submitted_chrg",
     "avg_medicare_allowed",
     "avg_medicare_payment",
-    "avg_medicare_stdzd",
 ]
 
 DOLLAR_COLS = [
     "avg_submitted_chrg",
     "avg_medicare_allowed",
     "avg_medicare_payment",
-    "avg_medicare_stdzd",
 ]
 
 # BLS CPI-U annual averages (all items, US city average, 1982-84=100).
@@ -165,7 +181,7 @@ PAGE_FETCH_WORKERS = 3
 # ---------------------------------------------------------------------------
 
 
-@st.cache_data(show_spinner=False, ttl=60 * 60 * 24, max_entries=12)
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24, max_entries=6)
 def fetch_year(year: int, specialty: str, _page_counter: dict | None = None) -> pd.DataFrame:
     """Fetch one year's data for one specialty via CMS's data-api, which
     filters server-side (filter[Rndrng_Prvdr_Type]=<specialty>) — the bulk
@@ -192,6 +208,8 @@ def fetch_year(year: int, specialty: str, _page_counter: dict | None = None) -> 
     base_url = f"https://data.cms.gov/data-api/v1/dataset/{dataset_id}/data"
     raw_to_canon = {v: k for k, v in SCHEMA_MAP.items()}
 
+    keep_raw = [SCHEMA_MAP[c] for c in REQUIRED_COLS]
+
     def fetch_page(offset: int):
         params = {
             "filter[Rndrng_Prvdr_Type]": specialty,
@@ -201,11 +219,16 @@ def fetch_year(year: int, specialty: str, _page_counter: dict | None = None) -> 
         resp = requests.get(base_url, params=params, timeout=60)
         resp.raise_for_status()
         page = resp.json()
+        n_rows = len(page)
         if _page_counter is not None:
             _page_counter[year] = _page_counter.get(year, 0) + 1
-        return offset, page
+        # Narrow each page to a compact frame immediately instead of
+        # accumulating raw 28-key dicts for the whole year.
+        page_df = pd.DataFrame.from_records(page, columns=keep_raw) if n_rows else None
+        del page
+        return offset, n_rows, page_df
 
-    records = []
+    frames = []
     next_offset = 0
     done = False
     with concurrent.futures.ThreadPoolExecutor(max_workers=PAGE_FETCH_WORKERS) as pool:
@@ -217,21 +240,21 @@ def fetch_year(year: int, specialty: str, _page_counter: dict | None = None) -> 
             # submitted, silently serializing everything.
             futures = [pool.submit(fetch_page, o) for o in batch_offsets]
             batch = sorted((f.result() for f in futures), key=lambda x: x[0])
-            for _offset, page in batch:
-                if not page:
+            for _offset, n_rows, page_df in batch:
+                if n_rows == 0:
                     done = True
                     break
-                records.extend(page)
-                if len(page) < API_PAGE_SIZE:
+                frames.append(page_df)
+                if n_rows < API_PAGE_SIZE:
                     done = True
                     break
             next_offset += PAGE_FETCH_WORKERS * API_PAGE_SIZE
 
-    if not records:
+    if not frames:
         return pd.DataFrame(columns=REQUIRED_COLS + ["year"] + [f"{c}_adj" for c in DOLLAR_COLS])
 
-    df = pd.DataFrame.from_records(records)
-    df = df.rename(columns=raw_to_canon)[REQUIRED_COLS]
+    df = pd.concat(frames, ignore_index=True).rename(columns=raw_to_canon)
+    del frames
 
     df["npi"] = df["npi"].astype(str)
     for c in NUMERIC_COLS:
@@ -446,19 +469,26 @@ def compute_drift(raw_df: pd.DataFrame, features: pd.DataFrame, metrics=DRIFT_ME
     result["fdr_p"] = p_adj
     result["z_flag"] = result["fdr_p"] < FDR_ALPHA
 
-    # Pre-filter to common NPIs and pre-group both years once — looking up
-    # curr_raw with a fresh boolean mask inside the loop (curr_raw.npi ==
-    # npi_val) was an O(n_providers x n_rows) scan, a real CPU hot spot for
-    # larger specialties. Dict-of-groups lookups make each iteration O(1).
-    prev_common_raw = raw_df.loc[(raw_df.year == y0) & raw_df["npi"].isin(common)]
-    curr_common_raw = raw_df.loc[(raw_df.year == y1) & raw_df["npi"].isin(common)]
-    curr_groups = dict(tuple(curr_common_raw.groupby("npi")))
+    # Per-provider payment arrays for each year, as numpy *views* into one
+    # sorted array. The obvious dict(groupby(...)) built a separate
+    # DataFrame per provider (tens of thousands), which alone added ~100MB
+    # of peak memory on a mid-sized specialty.
+    def payments_by_npi(year: int) -> dict:
+        sub = raw_df.loc[(raw_df.year == year) & raw_df["npi"].isin(common), ["npi", "avg_medicare_payment_adj"]]
+        codes, uniques = pd.factorize(sub["npi"])
+        order = np.argsort(codes, kind="stable")
+        values = sub["avg_medicare_payment_adj"].to_numpy(dtype=float)[order]
+        boundaries = np.cumsum(np.bincount(codes, minlength=len(uniques)))[:-1]
+        return dict(zip(uniques, np.split(values, boundaries)))
+
+    prev_payments = payments_by_npi(y0)
+    curr_payments = payments_by_npi(y1)
 
     psi_scores = {}
-    for npi_val, grp0 in prev_common_raw.groupby("npi"):
-        grp1 = curr_groups.get(npi_val)
-        if grp1 is not None and len(grp0) >= 5 and len(grp1) >= 5:
-            psi_scores[npi_val] = psi(grp0["avg_medicare_payment_adj"], grp1["avg_medicare_payment_adj"])
+    for npi_val, prev_vals in prev_payments.items():
+        curr_vals = curr_payments.get(npi_val)
+        if curr_vals is not None and len(prev_vals) >= 5 and len(curr_vals) >= 5:
+            psi_scores[npi_val] = psi(prev_vals, curr_vals)
     result["psi_score"] = pd.Series(psi_scores)
     result["psi_flag"] = result["psi_score"] > PSI_FLAG_THRESHOLD
 
@@ -555,6 +585,17 @@ def render_shap_waterfall(explainer, X: pd.DataFrame, npi_array, target_npi: str
 # ---------------------------------------------------------------------------
 
 ANALYSIS_CACHE_SIZE = 2
+
+
+def release_memory() -> None:
+    """Return freed heap to the OS. pandas/JSON work leaves a lot of freed-
+    but-retained memory on glibc, and Streamlit Cloud's limit is on total
+    resident memory, so this is what keeps repeated loads from creeping up."""
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except OSError:
+        pass  # not glibc (e.g. macOS) — nothing to trim
 
 
 @st.cache_resource(show_spinner=False)
@@ -823,6 +864,8 @@ if analysis_key not in analysis_store:
         st.stop()
     with st.spinner("Analyzing peer groups, drift and the explanation model…"):
         analysis_store[analysis_key] = analyze(raw_df)
+    del raw_df
+    release_memory()
     while len(analysis_store) > ANALYSIS_CACHE_SIZE:
         analysis_store.pop(next(iter(analysis_store)))
 
