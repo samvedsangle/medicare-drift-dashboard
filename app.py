@@ -692,6 +692,7 @@ def render_provider_trajectory(features: pd.DataFrame, selected_npi: str):
         title="Provider trajectory (indexed: first year = 100)",
         yaxis_title="Index (first year = 100)",
         legend=dict(orientation="h", yanchor="top", y=-0.22, xanchor="left", x=0),
+        hovermode="x unified",
     )
     _style_year_axis(fig)
     st.plotly_chart(fig, width="stretch")
@@ -731,6 +732,7 @@ def render_drift_trend(features: pd.DataFrame, metrics=DRIFT_METRICS):
         title="Specialty-wide median billing pattern (indexed: first year = 100)",
         yaxis_title="Index (first year = 100)",
         legend_title="Metric",
+        hovermode="x unified",
     )
     _style_year_axis(fig)
     st.plotly_chart(fig, width="stretch")
