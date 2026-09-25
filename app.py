@@ -4,7 +4,6 @@ import matplotlib.pyplot as plt
 import networkx as nx
 import numpy as np
 import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
 import requests
 import shap
@@ -133,6 +132,12 @@ SPECIALTIES = [
 ]
 
 DRIFT_METRICS = ("payment_per_service", "hcpcs_entropy", "submitted_allowed_ratio", "log_tot_srvcs")
+METRIC_LABELS = {
+    "payment_per_service": "Payment per service",
+    "hcpcs_entropy": "Billing-code diversity (entropy)",
+    "submitted_allowed_ratio": "Charge / allowed ratio",
+    "log_tot_srvcs": "Volume (log total services)",
+}
 MODEL_FEATURES = [
     "log_tot_srvcs",
     "log_tot_benes",
@@ -545,24 +550,71 @@ def render_shap_waterfall(explainer, X: pd.DataFrame, npi_array, target_npi: str
 # Chart / KPI renderers
 # ---------------------------------------------------------------------------
 
+def _index_to_first(values) -> np.ndarray:
+    """Rescale a series so its first value is 100 — puts metrics with very
+    different units (dollars vs. an entropy score) on one comparable axis so
+    drift is actually visible instead of one metric dwarfing the rest."""
+    arr = np.asarray(values, dtype=float)
+    if arr.size == 0 or not np.isfinite(arr[0]) or arr[0] == 0:
+        return np.full(arr.shape, np.nan)
+    return arr / arr[0] * 100
+
+
+def _style_year_axis(fig: go.Figure) -> None:
+    # dtick=1 + integer format: otherwise plotly invents "2,022.5"-style ticks.
+    fig.update_xaxes(title_text="Year", dtick=1, tickformat="d")
+
+
 def render_peer_scatter(features: pd.DataFrame, drift: pd.DataFrame, year: int, selected_npi: str):
     sub = features[features.year == year]
     if drift is not None and not drift.empty:
         sub = sub.merge(drift[["npi", "combined_z", "cross_method_flag"]], on="npi", how="left")
+    else:
+        sub = sub.assign(combined_z=np.nan, cross_method_flag=False)
     if sub.empty:
         st.info("No data available for this year.")
         return
 
-    fig = px.scatter(
-        sub,
-        x="log_tot_srvcs",
-        y="payment_per_service",
-        color=sub["combined_z"] if "combined_z" in sub else None,
-        color_continuous_scale="RdBu_r",
-        hover_data=["npi", "peer_cluster"],
-        labels={"log_tot_srvcs": "Log(Total Services)", "payment_per_service": "Avg Payment / Service ($, real)"},
-        title=f"Peer Landscape — {year}",
-    )
+    scored = sub[sub["combined_z"].notna()]
+    unscored = sub[sub["combined_z"].isna()]
+
+    fig = go.Figure()
+    if not unscored.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=unscored["log_tot_srvcs"],
+                y=unscored["payment_per_service"],
+                mode="markers",
+                marker=dict(color="lightgray", size=5, opacity=0.5),
+                customdata=unscored[["npi"]].to_numpy(),
+                hovertemplate="NPI %{customdata[0]}<br>No prior-year data<extra></extra>",
+                name="No prior-year data",
+            )
+        )
+    if not scored.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=scored["log_tot_srvcs"],
+                y=scored["payment_per_service"],
+                mode="markers",
+                marker=dict(
+                    color=scored["combined_z"],
+                    colorscale="RdBu_r",
+                    cmin=-4,
+                    cmax=4,
+                    size=6,
+                    opacity=0.75,
+                    colorbar=dict(title="Drift z-score"),
+                ),
+                customdata=scored[["npi", "peer_cluster", "combined_z"]].to_numpy(),
+                hovertemplate=(
+                    "NPI %{customdata[0]}<br>Peer cluster %{customdata[1]}"
+                    "<br>Drift z-score %{customdata[2]:.2f}<extra></extra>"
+                ),
+                name="Providers",
+                showlegend=False,
+            )
+        )
     row = sub[sub.npi == selected_npi]
     if not row.empty:
         fig.add_trace(
@@ -574,6 +626,36 @@ def render_peer_scatter(features: pd.DataFrame, drift: pd.DataFrame, year: int, 
                 name="Selected provider",
             )
         )
+    fig.update_layout(
+        title=f"Peer landscape — {year}",
+        xaxis_title="Log(total services)",
+        yaxis_title="Avg payment / service ($, inflation-adjusted)",
+        legend=dict(orientation="h", yanchor="top", y=-0.22, xanchor="left", x=0),
+    )
+    st.plotly_chart(fig, width="stretch")
+
+
+def render_provider_trajectory(features: pd.DataFrame, selected_npi: str):
+    traj = features[features.npi == selected_npi].sort_values("year")
+    fig = go.Figure()
+    for m in DRIFT_METRICS:
+        fig.add_trace(
+            go.Scatter(
+                x=traj["year"],
+                y=_index_to_first(traj[m]),
+                customdata=traj[m].to_numpy(),
+                mode="lines+markers",
+                name=METRIC_LABELS[m],
+                hovertemplate="%{x}: index %{y:.1f} (raw %{customdata:.3g})<extra>" + METRIC_LABELS[m] + "</extra>",
+            )
+        )
+    fig.add_hline(y=100, line_dash="dot", line_color="gray")
+    fig.update_layout(
+        title="Provider trajectory (indexed: first year = 100)",
+        yaxis_title="Index (first year = 100)",
+        legend=dict(orientation="h", yanchor="top", y=-0.22, xanchor="left", x=0),
+    )
+    _style_year_axis(fig)
     st.plotly_chart(fig, width="stretch")
 
 
@@ -591,16 +673,28 @@ def render_kpi_strip(features: pd.DataFrame, drift: pd.DataFrame, year: int):
 
 
 def render_drift_trend(features: pd.DataFrame, metrics=DRIFT_METRICS):
-    trend = features.groupby("year")[list(metrics)].median().reset_index()
+    trend = features.groupby("year")[list(metrics)].median().reset_index().sort_values("year")
     fig = go.Figure()
     for m in metrics:
-        fig.add_trace(go.Scatter(x=trend["year"], y=trend[m], mode="lines+markers", name=m))
+        fig.add_trace(
+            go.Scatter(
+                x=trend["year"],
+                y=_index_to_first(trend[m]),
+                customdata=trend[m].to_numpy(),
+                mode="lines+markers",
+                name=METRIC_LABELS.get(m, m),
+                hovertemplate="%{x}: index %{y:.1f} (raw %{customdata:.3g})<extra>"
+                + METRIC_LABELS.get(m, m)
+                + "</extra>",
+            )
+        )
+    fig.add_hline(y=100, line_dash="dot", line_color="gray")
     fig.update_layout(
-        title="Specialty-Wide Median Billing Pattern Over Time",
-        xaxis_title="Year",
-        yaxis_title="Median value (metric-specific units)",
+        title="Specialty-wide median billing pattern (indexed: first year = 100)",
+        yaxis_title="Index (first year = 100)",
         legend_title="Metric",
     )
+    _style_year_axis(fig)
     st.plotly_chart(fig, width="stretch")
 
 
@@ -734,12 +828,7 @@ with tab_provider:
 
     col_traj, col_scatter = st.columns(2)
     with col_traj:
-        traj = features[features.npi == selected_npi].sort_values("year")
-        fig = go.Figure()
-        for m in DRIFT_METRICS:
-            fig.add_trace(go.Scatter(x=traj["year"], y=traj[m], mode="lines+markers", name=m))
-        fig.update_layout(title="Provider Trajectory Across Years", xaxis_title="Year")
-        st.plotly_chart(fig, width="stretch")
+        render_provider_trajectory(features, selected_npi)
 
     with col_scatter:
         render_peer_scatter(features, drift, latest_year, selected_npi)
@@ -781,13 +870,13 @@ with tab_specialty:
 
     st.subheader("Peer Cluster Distribution (latest year)")
     cluster_counts = curr_features["peer_cluster"].value_counts().sort_index()
-    st.bar_chart(cluster_counts)
+    st.bar_chart(cluster_counts, x_label="Peer cluster", y_label="Providers")
 
     st.subheader("Community Structure (latest year)")
     if community_map:
         curr_features["community"] = curr_features["npi"].map(community_map)
         community_counts = curr_features["community"].value_counts().sort_index()
-        st.bar_chart(community_counts)
+        st.bar_chart(community_counts, x_label="Community", y_label="Providers")
         st.caption(
             f"{community_counts.shape[0]} communities detected among {len(community_map):,} providers "
             "via Louvain modularity on a k-nearest-neighbor similarity graph of practice-pattern features."
