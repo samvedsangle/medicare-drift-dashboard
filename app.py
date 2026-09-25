@@ -165,7 +165,7 @@ PAGE_FETCH_WORKERS = 3
 # ---------------------------------------------------------------------------
 
 
-@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24, max_entries=12)
 def fetch_year(year: int, specialty: str, _page_counter: dict | None = None) -> pd.DataFrame:
     """Fetch one year's data for one specialty via CMS's data-api, which
     filters server-side (filter[Rndrng_Prvdr_Type]=<specialty>) — the bulk
@@ -380,8 +380,12 @@ def psi(expected, actual, buckets: int = 10) -> float:
     """Population Stability Index between two distributions. <0.1 = stable,
     0.1-0.25 = moderate shift, >0.25 = significant shift (standard credit-risk
     convention, reused here for billing-pattern shift)."""
-    expected = pd.Series(expected).dropna()
-    actual = pd.Series(actual).dropna()
+    # Plain numpy (not pd.Series) — this runs once per provider, and building
+    # two Series per call dominated the drift step's runtime.
+    expected = np.asarray(expected, dtype=float)
+    actual = np.asarray(actual, dtype=float)
+    expected = expected[~np.isnan(expected)]
+    actual = actual[~np.isnan(actual)]
     if len(expected) < 5 or len(actual) < 5:
         return np.nan
 
@@ -549,6 +553,40 @@ def render_shap_waterfall(explainer, X: pd.DataFrame, npi_array, target_npi: str
 # ---------------------------------------------------------------------------
 # Chart / KPI renderers
 # ---------------------------------------------------------------------------
+
+ANALYSIS_CACHE_SIZE = 2
+
+
+@st.cache_resource(show_spinner=False)
+def get_analysis_store() -> dict:
+    """Process-wide store of finished analyses, keyed by (specialty, years).
+    Streamlit reruns the whole script on every click, and the analysis
+    (clustering, drift/PSI, community detection, model training) took ~30s —
+    so switching providers cost ~30s each time even though only the selected
+    NPI changed. Kept as a small bounded dict (see ANALYSIS_CACHE_SIZE) so
+    memory stays inside the free tier."""
+    return {}
+
+
+def analyze(raw_df: pd.DataFrame) -> dict:
+    features = build_peer_clusters(build_provider_features(raw_df))
+    drift = compute_drift(raw_df, features, DRIFT_METRICS)
+    latest_year = int(features["year"].max())
+    _, community_map = compute_communities(features, latest_year)
+    curr_features = features[features.year == latest_year].copy()
+    model, model_X, model_npis = train_model(curr_features, drift, MODEL_FEATURES)
+    return {
+        "features": features,
+        "drift": drift,
+        "latest_year": latest_year,
+        "community_map": community_map,
+        "curr_features": curr_features,
+        "model": model,
+        "model_X": model_X,
+        "model_npis": model_npis,
+        "explainer": build_shap_explainer(model, model_X),
+    }
+
 
 def _index_to_first(values) -> np.ndarray:
     """Rescale a series so its first value is 100 — puts metrics with very
@@ -773,24 +811,33 @@ with st.sidebar:
     years = all_years if full_history else recent_years
     st.caption(f"Years analyzed: {years[0]}–{years[-1]}")
 
-years_key = years
+analysis_key = (specialty, years)
+analysis_store = get_analysis_store()
+if analysis_key not in analysis_store:
+    with st.spinner(f"Fetching live CMS data for {specialty} ({years[0]}-{years[-1]})… first load takes a while."):
+        raw_df = load_all_years(specialty, years)
+    if raw_df.empty:
+        st.error("No rows returned for this specialty. Check the specialty name against CMS's Rndrng_Prvdr_Type values.")
+        st.stop()
+    with st.spinner("Analyzing peer groups, drift and the explanation model…"):
+        analysis_store[analysis_key] = analyze(raw_df)
+    while len(analysis_store) > ANALYSIS_CACHE_SIZE:
+        analysis_store.pop(next(iter(analysis_store)))
 
-with st.spinner(f"Fetching live CMS data for {specialty} ({years[0]}-{years[-1]})… first load takes a while."):
-    raw_df = load_all_years(specialty, years_key)
-
-if raw_df.empty:
-    st.error("No rows returned for this specialty. Check the specialty name against CMS's Rndrng_Prvdr_Type values.")
-    st.stop()
-
-features = build_provider_features(raw_df)
-features = build_peer_clusters(features)
-drift = compute_drift(raw_df, features, DRIFT_METRICS)
-latest_year = int(features["year"].max())
-_, community_map = compute_communities(features, latest_year)
-
-curr_features = features[features.year == latest_year].copy()
-model, model_X, model_npis = train_model(curr_features, drift, MODEL_FEATURES)
-explainer = build_shap_explainer(model, model_X)
+_analysis = analysis_store[analysis_key]
+features = _analysis["features"]
+drift = _analysis["drift"]
+latest_year = _analysis["latest_year"]
+community_map = _analysis["community_map"]
+model, model_X, model_npis, explainer = (
+    _analysis["model"],
+    _analysis["model_X"],
+    _analysis["model_npis"],
+    _analysis["explainer"],
+)
+# Copy: the analysis dict is shared across reruns and sessions, and the
+# Specialty Overview tab adds a column to this frame.
+curr_features = _analysis["curr_features"].copy()
 
 with st.sidebar:
     top_providers = curr_features.sort_values("tot_srvcs", ascending=False).head(500)
