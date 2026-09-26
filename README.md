@@ -79,11 +79,23 @@ in one glance instead of re-deriving it from the raw numbers.
 
 ## Analyst memo generation
 
-The "Generate Memo" button sends a provider's drift metrics and top SHAP
-contributors to Claude (via the Anthropic API) to draft a short, neutral analyst
-memo. It is rate-limited to 10 generations per browser session to control API
-spend. **The memo is a drafting aid, not a verified conclusion** — read the
-disclaimer below before trusting or forwarding its wording.
+The "Generate Memo" button produces a short, neutral analyst memo for the
+selected provider. It works **with or without an API key**:
+
+- **Default (no key needed): rule-based summary.** The memo is written directly
+  from the computed statistics — drift verdict (both / one / neither method),
+  the peer-relative z-score and FDR-adjusted p-value, the PSI shift, the metrics
+  that moved most versus peers, the top SHAP drivers, and suggested reviewer
+  next steps. It costs nothing, has no rate limit, and every visitor gets it.
+- **Optional: Claude-drafted memo.** If `ANTHROPIC_API_KEY` is set in the app's
+  Streamlit secrets, the button sends the same statistics to Claude to draft the
+  memo instead, limited to 10 per browser session to control API spend. If the
+  key is missing, the limit is reached, or the call fails, the button falls back
+  to the rule-based summary rather than erroring. Each memo is labeled with its
+  source.
+
+**The memo is a drafting aid, not a verified conclusion** — read the disclaimer
+below before trusting or forwarding its wording.
 
 ## Disclaimer
 

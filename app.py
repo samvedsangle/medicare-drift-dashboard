@@ -831,6 +831,118 @@ as statistical leads that warrant human review."""
     return response.content[0].text
 
 
+FEATURE_LABELS = {
+    **METRIC_LABELS,
+    "log_tot_benes": "Patient volume (log beneficiaries)",
+    "n_hcpcs_codes": "Number of distinct billing codes",
+}
+
+
+def claude_configured() -> bool:
+    try:
+        key = st.secrets.get("ANTHROPIC_API_KEY")
+    except Exception:
+        return False
+    return bool(key) and not str(key).startswith("sk-ant-your")
+
+
+def build_rule_based_memo(provider_row: pd.Series, drift_row, shap_explanation) -> str:
+    """Neutral analyst summary written directly from the computed statistics —
+    no LLM and no API key, so it works for every visitor at zero cost."""
+    blocks = [
+        f"**Provider {provider_row.get('npi')}** — {provider_row.get('specialty')}, {provider_row.get('state')}"
+    ]
+
+    if drift_row is None:
+        blocks.append(
+            "This provider has no record in the prior year, so year-over-year drift cannot be assessed. "
+            "Only their current-year position among peers (see the peer landscape chart) is available."
+        )
+    else:
+        y0, y1 = int(drift_row["baseline_year"]), int(drift_row["current_year"])
+        z_flag, psi_flag = bool(drift_row["z_flag"]), bool(drift_row["psi_flag"])
+        if z_flag and psi_flag:
+            verdict = "flagged by **both** independent methods (the higher-confidence signal)"
+        elif z_flag:
+            verdict = "flagged by the peer-relative test only"
+        elif psi_flag:
+            verdict = "flagged by the payment-distribution shift (PSI) test only"
+        else:
+            verdict = "not flagged by either method"
+        blocks.append(f"Between {y0} and {y1}, this provider's billing pattern is {verdict}.")
+
+        psi_value = drift_row["psi_score"]
+        if pd.isna(psi_value):
+            psi_text = "not computed (fewer than 5 service lines in one of the years)"
+        else:
+            level = "significant shift" if psi_value > 0.25 else "moderate shift" if psi_value >= 0.1 else "stable"
+            psi_text = f"{psi_value:.3f} ({level})"
+        bullets = [
+            f"- Peer-relative drift score: z = {drift_row['combined_z']:+.2f} "
+            f"(FDR-adjusted p = {drift_row['fdr_p']:.3g}), measured against providers in the same peer cluster.",
+            f"- Shift in the provider's own per-service payment distribution vs. {y0} (PSI): {psi_text}.",
+        ]
+
+        movers = []
+        for m in DRIFT_METRICS:
+            z, delta = drift_row.get(f"{m}_z"), drift_row.get(f"{m}_delta")
+            if pd.isna(z) or pd.isna(delta):
+                continue
+            if m == "payment_per_service":
+                text = f"payment per service {delta:+.2f} USD in real terms"
+            elif m == "submitted_allowed_ratio":
+                text = f"charge/allowed ratio {delta:+.2f}"
+            elif m == "hcpcs_entropy":
+                text = f"billing-code diversity {delta:+.2f}"
+            else:
+                text = f"service volume about {(np.exp(delta) - 1) * 100:+.0f}%"
+            movers.append((abs(z), text, z))
+        movers.sort(reverse=True)
+        if movers:
+            described = "; ".join(f"{text} (peer z = {z:+.1f})" for _, text, z in movers[:2])
+            bullets.append(f"- Largest movements relative to peers: {described}.")
+
+        if shap_explanation is not None:
+            order = np.argsort(-np.abs(shap_explanation.values))[:3]
+            drivers = ", ".join(
+                f"{FEATURE_LABELS.get(shap_explanation.feature_names[i], shap_explanation.feature_names[i])} "
+                f"{'raises' if shap_explanation.values[i] > 0 else 'lowers'} it"
+                for i in order
+            )
+            bullets.append(f"- Top drivers of this score in the explanation model: {drivers}.")
+        blocks.append("\n".join(bullets))
+
+    if drift_row is None:
+        blocks.append(
+            "**Suggested next steps for a reviewer:** compare the provider's billing-code mix and place-of-service "
+            "with peers of similar volume, and check the provider again once a second year of data is available."
+        )
+    else:
+        blocks.append(
+            "**Suggested next steps for a reviewer:** compare the provider's billing-code mix and place-of-service "
+            "between the two years, look for newly added or dropped procedure codes, consider practice or staffing "
+            "changes that could explain the shift, and review peers in the same cluster with similar values."
+        )
+    blocks.append(
+        "*Rule-based summary generated from the statistics above. It is a statistical lead for human review, "
+        "not a finding of wrongdoing.*"
+    )
+    return "\n\n".join(blocks)
+
+
+def make_memo(provider_row: pd.Series, drift_row, shap_explanation, allow_claude: bool):
+    """Returns (text, source, note). Uses Claude only when a real key is
+    configured and the per-session limit allows; otherwise (or if the call
+    fails) falls back to the rule-based summary so the button always works."""
+    if allow_claude and claude_configured():
+        try:
+            return generate_memo(provider_row, drift_row, shap_explanation), "Claude", None
+        except Exception as exc:
+            note = f"Claude drafting was unavailable ({type(exc).__name__}); showing the rule-based summary instead."
+            return build_rule_based_memo(provider_row, drift_row, shap_explanation), "rule-based", note
+    return build_rule_based_memo(provider_row, drift_row, shap_explanation), "rule-based", None
+
+
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
@@ -934,27 +1046,37 @@ with tab_provider:
 
     st.subheader("Generate Analyst Memo")
     clicks = st.session_state.get("memo_clicks", 0)
-    st.caption(f"{clicks}/{MEMO_RATE_LIMIT} memos generated this session.")
+    use_claude = claude_configured()
+    allow_claude = clicks < MEMO_RATE_LIMIT
+    if use_claude:
+        st.caption(f"{clicks}/{MEMO_RATE_LIMIT} AI-drafted memos used this session.")
+        if not allow_claude:
+            st.info("AI memo limit reached for this session — the button now gives the rule-based summary instead.")
+    else:
+        st.caption("Rule-based summary written directly from the statistics above.")
     if st.button("Generate Memo"):
-        if clicks >= MEMO_RATE_LIMIT:
-            st.error("Rate limit reached for this session (10 memos). Refresh the page to reset.")
-        elif provider_row.empty:
+        if provider_row.empty:
             st.error("No feature data available for this provider.")
         else:
-            st.session_state["memo_clicks"] = clicks + 1
-            try:
-                with st.spinner("Generating memo…"):
-                    memo_text = generate_memo(provider_row.iloc[0], drift_row, shap_explanation)
-                st.session_state["last_memo"] = memo_text
-                st.session_state["last_memo_npi"] = selected_npi
-            except Exception as exc:
-                st.error(f"Memo generation failed: {exc}")
+            with st.spinner("Generating memo…"):
+                memo_text, memo_source, memo_note = make_memo(
+                    provider_row.iloc[0], drift_row, shap_explanation, allow_claude
+                )
+            if memo_source == "Claude":
+                st.session_state["memo_clicks"] = clicks + 1
+            st.session_state["last_memo"] = memo_text
+            st.session_state["last_memo_npi"] = selected_npi
+            st.session_state["last_memo_source"] = memo_source
+            st.session_state["last_memo_note"] = memo_note
     # Only show a memo if it was generated for the CURRENTLY selected
     # provider — otherwise switching providers without re-clicking left the
     # previous provider's memo text displayed under the new provider's
     # section with nothing indicating it was stale/mismatched.
     if st.session_state.get("last_memo_npi") == selected_npi and "last_memo" in st.session_state:
+        if st.session_state.get("last_memo_note"):
+            st.info(st.session_state["last_memo_note"])
         st.markdown(st.session_state["last_memo"])
+        st.caption(f"Source: {st.session_state.get('last_memo_source', 'rule-based')}")
 
 with tab_specialty:
     st.subheader("Drift Trend")
